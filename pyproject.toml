@@ -61,6 +61,9 @@ line-length = 100
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501", "N802", "N806", "N812"]
 
+[tool.ruff.lint.per-file-ignores]
+"spikeflow/exact/*" = ["UP006", "UP045", "UP035", "N803", "N806", "E741", "F841", "I001"]
+
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true

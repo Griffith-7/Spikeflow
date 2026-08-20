@@ -16,6 +16,7 @@ from spikeflow import (
     datasets,
     encoders,
     energy,
+    exact,
     export,
     layers,
     models,
@@ -29,5 +30,5 @@ from spikeflow import (
 __all__ = [
     "neurons", "layers", "encoders", "datasets", "visualization",
     "attention", "training", "quantization", "models", "energy",
-    "pipelines", "export",
+    "pipelines", "export", "exact",
 ]
