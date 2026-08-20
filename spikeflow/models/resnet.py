@@ -137,18 +137,18 @@ class SpikingResNet(nn.Module):
         return self.fc(x)
 
     def reset_state(self):
-        for m in self.children():
-            if hasattr(m, "reset_state"):
+        for m in self.modules():
+            if m is not self and hasattr(m, "reset_state"):
                 m.reset_state()
 
     def set_sfa_mode(self, enabled: bool):
-        for m in self.children():
-            if hasattr(m, "set_sfa_mode"):
+        for m in self.modules():
+            if m is not self and hasattr(m, "set_sfa_mode"):
                 m.set_sfa_mode(enabled)
 
     def set_readout(self, enabled: bool):
-        for m in self.children():
-            if hasattr(m, "set_readout"):
+        for m in self.modules():
+            if m is not self and hasattr(m, "set_readout"):
                 m.set_readout(enabled)
 
 

@@ -94,7 +94,7 @@ class PiecewiseExpGrad(torch.autograd.Function):
 
 
 class ErfGrad(torch.autograd.Function):
-    """Heaviside with error function surrogate gradient."""
+    """Heaviside with error function surrogate gradient (derivative of erf sigmoid)."""
 
     @staticmethod
     def forward(ctx, x, alpha=2.0):
@@ -106,7 +106,7 @@ class ErfGrad(torch.autograd.Function):
     def backward(ctx, grad_output):
         (x,) = ctx.saved_tensors
         alpha = ctx.alpha
-        grad_input = grad_output * torch.erfc(alpha * x) / (2 * alpha)
+        grad_input = grad_output * (2 * alpha / (alpha * (2.0 ** 0.5) * (3.14159265358979 ** 0.5))) * torch.exp(-(alpha * x) ** 2)
         return grad_input, None
 
 
@@ -169,7 +169,10 @@ class LeakyKReLUGrad(torch.autograd.Function):
 
 
 class S2NNGrad(torch.autograd.Function):
-    """S2NN surrogate gradient (Stöckl & Maass, 2021)."""
+    """S2NN surrogate gradient (Stöckl & Maass, 2021).
+
+    Piecewise-quadratic: 0 below -1/alpha, quadratic in [-1/alpha, 1/alpha], 1 above.
+    """
 
     @staticmethod
     def forward(ctx, x, alpha=4.0):
@@ -182,7 +185,11 @@ class S2NNGrad(torch.autograd.Function):
         (x,) = ctx.saved_tensors
         alpha = ctx.alpha
         ax = alpha * x
-        grad_input = grad_output * torch.clamp(1 - ax.abs(), min=0)
+        grad_input = grad_output * torch.where(
+            ax < -1.0,
+            torch.zeros_like(ax),
+            torch.where(ax > 1.0, torch.ones_like(ax), 0.25 * (ax + 1.0) ** 2),
+        )
         return grad_input, None
 
 

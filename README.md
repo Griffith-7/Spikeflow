@@ -8,6 +8,8 @@
 
 **Train SNNs at transformer speed. Deploy with binary spike efficiency.**
 
+> **Status:** Alpha. API is stable. Benchmarks pending — accuracy and speed numbers below are targets based on architecture design, not measured results.
+
 ```
 pip install spikeflow
 ```
@@ -19,14 +21,15 @@ pip install spikeflow
 | Capability | SpikingJelly | snnTorch | Norse | **SpikeFlow** |
 |---|---|---|---|---|
 | Train at transformer speed (T=1) | ❌ | ❌ | ❌ | ✅ **SFA** |
-| Binary weights (1-bit, 32x compression) | ❌ | ❌ | ❌ | ✅ **125 MB / 1B params** |
+| Binary weights (1-bit) | ❌ | ❌ | ❌ | ✅ **BinaryConnect** |
 | XNOR attention (addition-only) | ❌ | ❌ | ❌ | ✅ **no multiplications** |
 | Single dependency (`torch>=2.1.0`) | ❌ torch+cupy+triton | ❌ torch+tonic | ❌ torch+pytest | ✅ **torch only** |
-| Surrogate gradients | 10+ | 3 | 4 | **10** (pq, erf, superspike, s2nn...) |
+| Surrogate gradients | 10+ | 3 | 4 | **10** (all unique) |
+| Exact gradients (IFT + saltation) | ❌ | ❌ | ❌ | ✅ **spikeflow.exact** |
 | Neuron models | 15+ | 9 | 6 | **7** (LIF, IF, PLIF, ALIF, Izhikevich, LSTM, RNN) |
 | Layer types | 20+ | 5 | 10+ | **10** (Conv1d/2d/3d, ConvTranspose, Linear, Pool, Dropout, Voting) |
-| CIFAR-10 (ResNet18) | 95.6% (BPTT T=4) | 57% | — | **77.4% (SFA T=1)** |
-| ImageNet (ResNet18) | 69-70% | — | — | **~70%** |
+| CIFAR-10 (ResNet18) | 95.6% (BPTT T=4) | 57% | — | *target: ~90%* |
+| ImageNet (ResNet18) | 69-70% | — | — | *target: ~69%* |
 | Neuromorphic datasets | 13 built-in | 2 | — | **5** (DVS, N-MNIST, SHD, SSC) |
 | ANN-to-SNN conversion | recipe-based | basic | — | **recipe + BN fold + threshold calib** |
 | Mixed precision (FP16/BF16) | ✅ | ❌ | ❌ | ✅ |
@@ -56,15 +59,15 @@ results = trainer.evaluate(test_loader)
 ## How SFA Works
 
 ```
-Standard SNN training:  T=4 loops → 4x slower than transformers
-SpikeFlow SFA:          T=1 train → same speed as transformers
-                        T=D infer → energy-efficient deployment
+Standard SNN training:  T=4 loops -> 4x slower than transformers
+SpikeFlow SFA:          T=1 train -> same speed as transformers
+                        T=D infer -> energy-efficient deployment
 ```
 
 ```
-Training (T=1):   x → [Linear → ReLU] → loss     ← standard backprop
-Inference (T=D):  x → [Linear → LIF] → spike train ← binary, energy-efficient
-                  ↑ same weights, different neuron mode
+Training (T=1):   x -> [Linear -> ReLU] -> loss     <- standard backprop
+Inference (T=D):  x -> [Linear -> LIF] -> spike train <- binary, energy-efficient
+                  ^ same weights, different neuron mode
 ```
 
 ## Architecture
@@ -80,6 +83,7 @@ spikeflow/
   quantization/  Binary (1-bit), INT8, INT4
   energy/        Multi-hardware energy profiler
   export/        NIR format for neuromorphic deployment
+  exact/         Exact IFT gradients + saltation matrices (from Exact-SNN)
   pipelines/     CIFAR-10, ImageNet, ANN-to-SNN, knowledge distillation
   datasets/      DVS128, N-MNIST, CIFAR10-DVS, SHD, SSC (via tonic)
 ```
@@ -88,26 +92,40 @@ spikeflow/
 
 | Module | Description | Dynamics |
 |--------|-------------|----------|
-| `LIFNode` | Leaky Integrate-and-Fire | v' = decay·v + x |
+| `LIFNode` | Leaky Integrate-and-Fire | v' = decay*v + x |
 | `IFNode` | Integrate-and-Fire (no leak) | v' = v + x |
-| `ParametricLIFNode` | LIF with learnable τ per channel | learnable decay |
+| `ParametricLIFNode` | LIF with learnable tau per channel | learnable decay |
 | `AdaptiveLIFNode` | Spike-frequency adaptation | threshold increases after spikes |
-| `IzhikevichNode` | Izhikevich (RS/IB/CH/LTS) | v' = 0.04v² + 5v + 140 - u + I |
+| `IzhikevichNode` | Izhikevich (RS/IB/CH/LTS) | v' = 0.04v^2 + 5v + 140 - u + I |
 | `SpikingLSTM` | LSTM with spiking membrane | gates + LIF readout |
 
 ## Surrogate Gradients
 
+All 10 surrogates are mathematically unique:
+
 | Name | Formula | Best for |
 |------|---------|----------|
-| `sigmoid` | σ'(αx) | general (default) |
-| `pq` | piecewise quadratic | most popular in SNN literature |
-| `erf` | erfc(αx)/2α | smooth gradients |
-| `superspike` | β·σ(βx)(1-σ(βx)) | Neftci et al. 2019 |
-| `s2nn` | clamp(1-|αx|) | Stöckl & Maass 2021 |
-| `atan` | 1/(1+(αx)²)/2 | fast approximation |
-| `pe` | exp(-α|x|) | exponential decay |
-| `softsign` | 1/(1+α|x|)² | bounded gradient |
-| `leaky_krelu` | α below, k above threshold | non-zero below threshold |
+| `sigmoid` | alpha / (1 + cosh(alpha*x))^2 | general (default) |
+| `pq` | piecewise linear: 1 - |alpha*x| | most popular in SNN literature |
+| `erf` | (2*alpha/sqrt(pi)) * exp(-(alpha*x)^2) | smooth gradients |
+| `superspike` | beta * sigmoid(beta*x) * (1 - sigmoid(beta*x)) | Neftci et al. 2019 |
+| `s2nn` | piecewise quadratic (Stockl & Maass 2021) | adaptive threshold |
+| `atan` | alpha / (1 + (alpha*x)^2) / 2 | fast approximation |
+| `pe` | exp(-alpha * |x|) | exponential decay |
+| `softsign` | 1 / (1 + alpha*|x|)^2 | bounded gradient |
+| `leaky_krelu` | k above, alpha below threshold | non-zero below threshold |
+| `heaviside` | straight-through (constant 1) | simple baseline |
+
+## Exact Gradients (spikeflow.exact)
+
+Mathematically exact gradients using Implicit Function Theorem and saltation matrices — no surrogate approximation. Forked from [Exact-SNN](https://github.com/Griffith-7/Exact-snn).
+
+```python
+from spikeflow.exact import TTFSNet
+
+net = TTFSNet([784, 128, 10])
+loss, grads, t_out = net.loss_and_grads(t_in, y)
+```
 
 ## Encoders
 
@@ -129,14 +147,14 @@ spikes = encoder(x)  # (T, batch, C*N)
 
 ## Models
 
-| Model | Params | CIFAR-10 | ImageNet |
-|-------|--------|----------|----------|
-| `SpikingResNet18` | 11M | 77.4% (50ep) | ~70% |
-| `SpikingPreActResNet20` | 0.27M | — | — |
-| `SpikingViTTiny` | 5.7M | — | ~75% |
-| `SpikingViTSmall` | 22M | — | ~80% |
-| `SpikingViTBase` | 87M | — | ~83% |
-| `SpikingConvNeXtTiny` | 29M | — | ~82% |
+| Model | Params | Status |
+|-------|--------|--------|
+| `SpikingResNet18` | 11M | implemented, needs benchmarking |
+| `SpikingPreActResNet20` | 0.27M | implemented, needs benchmarking |
+| `SpikingViTTiny` | 5.7M | implemented, needs benchmarking |
+| `SpikingViTSmall` | 22M | implemented, needs benchmarking |
+| `SpikingViTBase` | 87M | implemented, needs benchmarking |
+| `SpikingConvNeXtTiny` | 29M | implemented, needs benchmarking |
 
 ## Energy Profiling
 
@@ -200,24 +218,12 @@ cd Spikeflow && pip install -e ".[dev]"
 
 Only dependency: `torch>=2.1.0`
 
-## Benchmarks
-
-Tested on NVIDIA RTX 3050 (4GB):
-
-| Metric | Value |
-|--------|-------|
-| Training speed (SFA T=1) | 2,406 img/s |
-| Inference SFA (T=1) | 4.7 ms/batch |
-| Inference Spike (T=4) | 18.2 ms/batch |
-| Peak GPU memory | 381 MB |
-| CIFAR-10 best accuracy | 77.4% (50 epochs) |
-
 ## How It Works
 
 1. **SFA Training** — Neurons behave as ReLU during training (T=1), standard backprop. Same speed as transformers.
 2. **Spike Inference** — Neurons use real LIF dynamics at inference (T=D timesteps). Binary spikes replace multiplications.
-3. **Binary Quantization** — Weights quantized to 1-bit. 1B params = 125 MB. XNOR replaces matrix multiply.
-4. **Energy Savings** — Binary operations are 3-7x cheaper than FP16 on edge hardware.
+3. **Binary Quantization** — BinaryConnect optimizer clamps weights to {-1, +1} after each step. XNOR replaces matrix multiply.
+4. **Exact Gradients** — Optional IFT + saltation matrix gradients for TTFS networks (spikeflow.exact).
 
 ## Citation
 

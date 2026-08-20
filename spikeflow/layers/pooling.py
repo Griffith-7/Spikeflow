@@ -48,16 +48,25 @@ class SpikingAvgPool2d(nn.Module):
 
 
 class SpikingDropout(nn.Module):
-    """Dropout that is aware of spike states (drops entire neurons, not individual spikes)."""
+    """Spike-aware dropout that drops entire neurons across all timesteps.
+
+    Unlike standard dropout (which drops individual elements), this drops
+    the same neurons consistently across time, preserving temporal dynamics.
+    """
 
     def __init__(self, p: float = 0.5):
         super().__init__()
         self.p = p
 
     def forward(self, x: Tensor) -> Tensor:
-        if not self.training:
+        if not self.training or self.p == 0:
             return x
-        mask = (torch.rand_like(x) > self.p).float()
+        if x.ndim == 3:
+            mask = (torch.rand(x.shape[0], 1, x.shape[2], device=x.device) > self.p).float()
+        elif x.ndim == 4:
+            mask = (torch.rand(x.shape[0], x.shape[1], 1, 1, device=x.device) > self.p).float()
+        else:
+            mask = (torch.rand_like(x) > self.p).float()
         return x * mask / (1 - self.p)
 
     def reset_state(self):

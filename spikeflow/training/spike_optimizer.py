@@ -74,7 +74,11 @@ class SpikeAdamW(Optimizer):
 
 
 class BinaryConnect(Optimizer):
-    """BinaryConnect: clamp weights to [-1, 1] after each SGD step."""
+    """BinaryConnect: true 1-bit binarization using sign() during forward, STE in backward.
+
+    Weights are clamped to [-1, 1] and binarized to {-1, +1} via sign().
+    A straight-through estimator (STE) is used for gradient flow.
+    """
 
     def __init__(self, params, lr: float = 1e-3, momentum: float = 0.9, weight_decay: float = 1e-4):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
@@ -90,6 +94,7 @@ class BinaryConnect(Optimizer):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
+            wd = group["weight_decay"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -102,7 +107,12 @@ class BinaryConnect(Optimizer):
 
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(p.grad)
+
+                if wd > 0:
+                    p.mul_(1 - lr * wd)
+
                 p.add_(buf, alpha=-lr)
                 p.data.clamp_(-1, 1)
+                p.data.sign_()
 
         return loss
