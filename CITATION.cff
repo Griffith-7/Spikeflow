@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+title: "SpikeFlow"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - name: "SpikeFlow Contributors"
+license: MIT
+repository-code: "https://github.com/Griffith-7/Spikeflow"
