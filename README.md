@@ -22,8 +22,8 @@ pip install spikeflow
 |---|---|---|---|---|
 | Train at transformer speed (T=1) | ❌ | ❌ | ❌ | ✅ **SFA** |
 | Binary weights (1-bit) | ❌ | ❌ | ❌ | ✅ **BinaryConnect** |
-| XNOR attention (addition-only) | ❌ | ❌ | ❌ | ✅ **no multiplications** |
-| Single dependency (`torch>=2.1.0`) | ❌ torch+cupy+triton | ❌ torch+tonic | ❌ torch+pytest | ✅ **torch only** |
+| Sign/XNOR-style binary attention | ❌ | ❌ | ❌ | ✅ **simulated popcount** |
+| Single dependency (`torch>=2.1.0`) | ❌ torch+cupy+triton | ❌ torch+tonic | ❌ torch+pytest | ✅ **torch + numpy** |
 | Surrogate gradients | 10+ | 3 | 4 | **10** (all unique) |
 | Exact gradients (IFT + saltation) | ❌ | ❌ | ❌ | ✅ **spikeflow.exact** |
 | Neuron models | 15+ | 9 | 6 | **7** (LIF, IF, PLIF, ALIF, Izhikevich, LSTM, RNN) |
@@ -109,7 +109,7 @@ All 10 surrogates are mathematically unique:
 | `pq` | piecewise linear: 1 - |alpha*x| | most popular in SNN literature |
 | `erf` | (2*alpha/sqrt(pi)) * exp(-(alpha*x)^2) | smooth gradients |
 | `superspike` | beta * sigmoid(beta*x) * (1 - sigmoid(beta*x)) | Neftci et al. 2019 |
-| `s2nn` | piecewise quadratic (Stockl & Maass 2021) | adaptive threshold |
+| `s2nn` | sigmoid-derivative scaled by 1/(1+β\|x−1\|) (Stockl & Maass 2021) | decays both sides of threshold |
 | `atan` | alpha / (1 + (alpha*x)^2) / 2 | fast approximation |
 | `pe` | exp(-alpha * |x|) | exponential decay |
 | `softsign` | 1 / (1 + alpha*|x|)^2 | bounded gradient |
@@ -174,8 +174,13 @@ Supports: A100, V100, Loihi, ARM Cortex-M4.
 from spikeflow.export import NIRExporter
 
 exporter = NIRExporter()
-exporter.export(model, input_shape=(1, 3, 224, 224), path="model.nir")
+graph = exporter.export(model, input_shape=(1, 3, 224, 224))
+exporter.save(graph, "model.json")
 ```
+
+Exports a NIR-*inspired* JSON graph (sequential topology). This is not yet
+the standards-compliant NIR format — for Loihi/Lava deployment, convert via
+the official `nir` package.
 
 ## Mixed Precision + EMA
 
@@ -216,13 +221,13 @@ git clone https://github.com/Griffith-7/Spikeflow.git
 cd Spikeflow && pip install -e ".[dev]"
 ```
 
-Only dependency: `torch>=2.1.0`
+Only dependencies: `torch>=2.1.0`, `numpy`
 
 ## How It Works
 
 1. **SFA Training** — Neurons behave as ReLU during training (T=1), standard backprop. Same speed as transformers.
 2. **Spike Inference** — Neurons use real LIF dynamics at inference (T=D timesteps). Binary spikes replace multiplications.
-3. **Binary Quantization** — BinaryConnect optimizer clamps weights to {-1, +1} after each step. XNOR replaces matrix multiply.
+3. **Binary Quantization** — BinaryConnect optimizer clamps weights to {-1, +1} after each step. Sign-mode attention simulates XNOR-popcount similarity.
 4. **Exact Gradients** — Optional IFT + saltation matrix gradients for TTFS networks (spikeflow.exact).
 
 ## Citation

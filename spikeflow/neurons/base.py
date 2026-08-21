@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 
 import torch
@@ -13,7 +14,7 @@ class Heaviside(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x):
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -27,7 +28,7 @@ class SigmoidGrad(torch.autograd.Function):
     def forward(ctx, x, alpha=5.0):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -44,7 +45,7 @@ class ATanGrad(torch.autograd.Function):
     def forward(ctx, x, alpha=2.0):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -61,7 +62,7 @@ class PiecewiseQuadraticGrad(torch.autograd.Function):
     def forward(ctx, x, alpha=1.0):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -83,7 +84,7 @@ class PiecewiseExpGrad(torch.autograd.Function):
     def forward(ctx, x, alpha=1.0):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -94,19 +95,25 @@ class PiecewiseExpGrad(torch.autograd.Function):
 
 
 class ErfGrad(torch.autograd.Function):
-    """Heaviside with error function surrogate gradient (derivative of erf sigmoid)."""
+    """Heaviside with error function surrogate gradient.
+
+    Surrogate function: erf(alpha * x), whose derivative is the
+    Gaussian (2*alpha/sqrt(pi)) * exp(-(alpha*x)^2).
+    """
 
     @staticmethod
     def forward(ctx, x, alpha=2.0):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
         (x,) = ctx.saved_tensors
         alpha = ctx.alpha
-        grad_input = grad_output * (2 * alpha / (alpha * (2.0 ** 0.5) * (3.14159265358979 ** 0.5))) * torch.exp(-(alpha * x) ** 2)
+        grad_input = (
+            grad_output * (2.0 * alpha / math.sqrt(math.pi)) * torch.exp(-((alpha * x) ** 2))
+        )
         return grad_input, None
 
 
@@ -118,7 +125,7 @@ class SuperSpikeGrad(torch.autograd.Function):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
         ctx.beta = beta
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -136,7 +143,7 @@ class SoftSignGrad(torch.autograd.Function):
     def forward(ctx, x, alpha=1.0):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -154,7 +161,7 @@ class LeakyKReLUGrad(torch.autograd.Function):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
         ctx.k = k
-        return (x > 0).float()
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -171,26 +178,30 @@ class LeakyKReLUGrad(torch.autograd.Function):
 class S2NNGrad(torch.autograd.Function):
     """S2NN surrogate gradient (Stöckl & Maass, 2021).
 
-    Piecewise-quadratic: 0 below -1/alpha, quadratic in [-1/alpha, 1/alpha], 1 above.
+    Surrogate function: sigmoid(alpha * x) / (1 + beta * |x - 1|), so the
+    surrogate gradient is
+
+        alpha * sigmoid(alpha*x) * (1 - sigmoid(alpha*x)) / (1 + beta*|x-1|)
+
+    It peaks near threshold and decays to zero far from it in BOTH directions
+    (unlike a piecewise ramp, which stays constant above threshold).
     """
 
     @staticmethod
-    def forward(ctx, x, alpha=4.0):
+    def forward(ctx, x, alpha=4.0, beta=1.0):
         ctx.save_for_backward(x)
         ctx.alpha = alpha
-        return (x > 0).float()
+        ctx.beta = beta
+        return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
         (x,) = ctx.saved_tensors
-        alpha = ctx.alpha
-        ax = alpha * x
-        grad_input = grad_output * torch.where(
-            ax < -1.0,
-            torch.zeros_like(ax),
-            torch.where(ax > 1.0, torch.ones_like(ax), 0.25 * (ax + 1.0) ** 2),
-        )
-        return grad_input, None
+        alpha, beta = ctx.alpha, ctx.beta
+        sig = torch.sigmoid(alpha * x)
+        decay = 1.0 / (1.0 + beta * (x - 1.0).abs())
+        grad_input = grad_output * alpha * sig * (1.0 - sig) * decay
+        return grad_input, None, None
 
 
 class Threshold(nn.Module):
@@ -266,9 +277,15 @@ class BaseNeuron(nn.Module, ABC):
         return self.threshold_module(x)
 
     def neuronal_reset(self, spike: torch.Tensor):
-        """Reset membrane potential after firing."""
+        """Reset membrane potential after firing.
+
+        Hard reset: membrane is driven to ``v_reset`` where a spike was
+        emitted (identical to the previous reset-to-zero behavior when
+        ``v_reset=0``, which is the default).
+        """
         if self.v is not None and not self._sfa_mode:
-            self.v = self.v * (1.0 - spike.detach())
+            spike = spike.detach()
+            self.v = self.v * (1.0 - spike) + self.v_reset * spike
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.v is None:

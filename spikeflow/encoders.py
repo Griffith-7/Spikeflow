@@ -34,6 +34,11 @@ class LatencyEncoder(nn.Module):
 
     Input x in [0, 1] -> spike at time t = floor((1 - x) * T).
     Neuron fires once at its latency time, stays silent otherwise.
+
+    With ``temporal_output=False`` the (T, ...) dimension is collapsed and a
+    time-to-spike map is returned instead: each element holds the float spike
+    time in [0, T-1] (a pure latency code has no meaningful single-timestep
+    binary representation).
     """
 
     def __init__(self, timesteps: int = 4, temporal_output: bool = True):
@@ -45,9 +50,7 @@ class LatencyEncoder(nn.Module):
         x = x.clamp(0, 1)
         spike_times = ((1 - x) * self.T).long().clamp(0, self.T - 1)
         if not self.temporal_output:
-            spikes = torch.zeros_like(x)
-            spikes.scatter_(0, spike_times, 1.0)
-            return spikes
+            return spike_times.float()
         out = torch.zeros(self.T, *x.shape, device=x.device)
         for t in range(self.T):
             out[t] = (spike_times == t).float()

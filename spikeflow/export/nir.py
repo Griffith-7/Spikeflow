@@ -1,12 +1,14 @@
-"""NIR (Neural Intermediate Representation) export for neuromorphic deployment.
+"""Graph export for neuromorphic deployment (NIR-inspired JSON).
 
-NIR is the open standard for exchanging SNN models between frameworks.
-Export your trained SpikeFlow model to NIR format for deployment on:
-    - Intel Loihi (via Lava)
-    - SpiNNaker (via Nengo)
-    - custom neuromorphic hardware
+IMPORTANT — this is NOT the NIR standard. The output is SpikeFlow's own
+JSON graph format, *inspired by* the Neuromorphic Intermediate Representation
+(NIR). It cannot be loaded directly by Lava or Nengo; for a
+standards-compliant export, convert via the official ``nir`` package.
 
-Based on: https://github.com/INL/NeuromorphicIntermediateRepresentation
+Known limitations of this exporter:
+    - Topology is a linear chain following ``named_modules()`` order; residual
+      connections (e.g. ResNet skips) are not representable and are lost.
+    - Only Linear / Conv2d / LIF / IF / pooling / flatten nodes are captured.
 """
 
 from __future__ import annotations
@@ -17,17 +19,17 @@ import torch.nn as nn
 
 
 class NIRExporter:
-    """Export SpikeFlow models to NIR format.
+    """Export SpikeFlow models to a NIR-inspired JSON graph.
 
-    NIR is a graph-based intermediate representation that captures:
+    The graph captures:
         - Neuron dynamics (LIF parameters)
-        - Connectivity (weights, biases)
+        - Connectivity (weights, biases) for sequential subgraphs
         - Time constants (tau, threshold)
 
     Usage:
         exporter = NIRExporter()
-        nir_graph = exporter.export(model, input_shape=(1, 3, 224, 224))
-        exporter.save(nir_graph, "model.nir")
+        graph = exporter.export(model, input_shape=(1, 3, 224, 224))
+        exporter.save(graph, "model.json")
     """
 
     def __init__(self):
@@ -81,6 +83,53 @@ class NIRExporter:
                 prev_node = node_id
                 node_id += 1
 
+            elif isinstance(module, (nn.MaxPool1d, nn.MaxPool2d, nn.MaxPool3d, nn.AvgPool1d, nn.AvgPool2d, nn.AvgPool3d)):
+                ks = module.kernel_size
+                st = module.stride if module.stride is not None else ks
+                pd = module.padding
+                dil = getattr(module, "dilation", 1)
+                spatial_dims = 1 if isinstance(module, (nn.MaxPool1d, nn.AvgPool1d)) else (
+                    2 if isinstance(module, (nn.MaxPool2d, nn.AvgPool2d)) else 3
+                )
+
+                def normalize(value):
+                    return list(value) if isinstance(value, (tuple, list)) else [value] * spatial_dims
+
+                node = {
+                    "id": node_id,
+                    "name": name,
+                    "type": "pool",
+                    "pool_type": "max" if isinstance(
+                        module,
+                        (nn.MaxPool1d, nn.MaxPool2d, nn.MaxPool3d),
+                    ) else "avg",
+                    "kernel_size": normalize(ks),
+                    "stride": normalize(st),
+                    "padding": normalize(pd),
+                    "ceil_mode": module.ceil_mode,
+                    "dilation": normalize(dil),
+                    "count_include_pad": getattr(module, "count_include_pad", None),
+                    "return_indices": getattr(module, "return_indices", False),
+                    "divisor_override": getattr(module, "divisor_override", None),
+                }
+                self.nodes.append(node)
+                if prev_node is not None:
+                    self.edges.append({"from": prev_node, "to": node_id})
+                prev_node = node_id
+                node_id += 1
+
+            elif isinstance(module, nn.Flatten):
+                node = {
+                    "id": node_id,
+                    "name": name,
+                    "type": "flatten",
+                }
+                self.nodes.append(node)
+                if prev_node is not None:
+                    self.edges.append({"from": prev_node, "to": node_id})
+                prev_node = node_id
+                node_id += 1
+
             elif hasattr(module, "threshold_module"):
                 # Spiking neuron node
                 from spikeflow.neurons.if_cell import IFNode
@@ -120,8 +169,9 @@ class NIRExporter:
                 node_id += 1
 
         return {
-            "format": "spikeflow_nir",
-            "version": "0.1.0",
+            "format": "spikeflow-graph",
+            "note": "NIR-inspired JSON; not compatible with the NIR standard",
+            "version": "0.2.0",
             "nodes": self.nodes,
             "edges": self.edges,
             "input_shape": input_shape,

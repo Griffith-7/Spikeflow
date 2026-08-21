@@ -49,7 +49,7 @@ class TestNIRExporter:
         nir_graph = exporter.export(model, input_shape=(1, 3, 32, 32))
         assert len(nir_graph["nodes"]) > 0
         assert len(nir_graph["edges"]) > 0
-        assert nir_graph["format"] == "spikeflow_nir"
+        assert nir_graph["format"] == "spikeflow-graph"
 
     def test_summary(self):
         model = SpikingResNet18(num_classes=10)
@@ -66,5 +66,5 @@ class TestNIRExporter:
         path = str(tmp_path / "model.nir")
         exporter.save(nir_graph, path)
         loaded = exporter.load(path)
-        assert loaded["format"] == "spikeflow_nir"
+        assert loaded["format"] == "spikeflow-graph"
         assert len(loaded["nodes"]) == len(nir_graph["nodes"])

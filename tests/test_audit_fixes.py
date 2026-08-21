@@ -77,8 +77,8 @@ class TestB1SetSfaModePropagation:
 
 
 class TestB2S2nnGradientDiffersFromPq:
-    """S2NN (Stockl & Maass 2021) must use a different piecewise-quadratic
-    formula than PiecewiseQuadraticGrad, not just clamp(1-|ax|)."""
+    """S2NN (Stockl & Maass 2021) must use a different formula than
+    PiecewiseQuadraticGrad, not just clamp(1-|ax|)."""
 
     def test_forward_same_heaviside(self):
         x = torch.tensor([-0.5, -0.25, 0.0, 0.25, 0.5])
@@ -98,18 +98,26 @@ class TestB2S2nnGradientDiffersFromPq:
 
         assert not torch.allclose(pq_grad, s2nn_grad), (
             "S2NN and PQ gradients are identical — S2NN likely uses "
-            "the wrong formula (clamp(1-|ax|) instead of 0.25*(ax+1)^2)"
+            "the wrong formula"
         )
 
-    def test_s2nn_peak_is_at_zero(self):
-        """S2NN gradient peaks at x=0 with value 0.25."""
-        alpha = 4.0
+    def test_s2nn_value_at_zero(self):
+        """S2NN gradient at x=0: alpha*sig*(1-sig)/(1+beta*|x-1|)
+        with alpha=4, beta=1 -> 4*0.5*0.5/2 = 0.5."""
+        alpha, beta = 4.0, 1.0
         x = torch.tensor([0.0], requires_grad=True)
-        y = S2NNGrad.apply(x, alpha)
-        y.backward()
-        # At ax=0: 0.25*(0+1)^2 = 0.25
-        expected_peak = 0.25
-        assert torch.allclose(x.grad, torch.tensor([expected_peak]), atol=1e-5)
+        S2NNGrad.apply(x, alpha, beta).backward()
+        expected = alpha * 0.25 / (1 + beta)
+        assert torch.allclose(x.grad, torch.tensor([expected]), atol=1e-5)
+
+    def test_s2nn_decays_far_from_threshold(self):
+        """Real S2NN decays to zero in BOTH directions; a piecewise ramp
+        would stay constant above threshold."""
+        x = torch.tensor([-20.0, 20.0], requires_grad=True)
+        S2NNGrad.apply(x).sum().backward()
+        assert x.grad.abs().max() < 1e-3, (
+            f"S2NN gradient must decay to ~0 far from threshold, got {x.grad.tolist()}"
+        )
 
 
 class TestB3BinaryConnectBinarization:
@@ -198,19 +206,28 @@ class TestB4SpikingDropoutNeuronLevel:
 
 
 class TestB5ErfGradFormula:
-    """ErfGrad must use: 2*alpha / sqrt(2*pi) * exp(-(alpha*x)^2)
-    (derivative of the erf sigmoid)."""
+    """ErfGrad must use the derivative of erf(alpha*x):
+    (2*alpha/sqrt(pi)) * exp(-(alpha*x)^2)."""
 
     def test_at_zero(self):
         alpha = 2.0
         x = torch.tensor([0.0], requires_grad=True)
         y = ErfGrad.apply(x, alpha)
         y.backward()
-        # Code formula: 2*alpha / (alpha * sqrt(2) * sqrt(pi)) * exp(-(alpha*x)^2)
-        # At x=0: 2/(sqrt(2)*sqrt(pi)) = sqrt(2/pi) ≈ 0.798
-        expected = math.sqrt(2.0 / math.pi)
+        expected = 2.0 * alpha / math.sqrt(math.pi)
         assert torch.allclose(x.grad, torch.tensor([expected]), atol=1e-4), (
             f"ErfGrad at x=0: got {x.grad.item():.6f}, expected {expected:.6f}"
+        )
+
+    def test_alpha_scales_prefactor(self):
+        """The alpha must NOT cancel out of the prefactor."""
+        grads = []
+        for alpha in [1.0, 4.0]:
+            x = torch.tensor([0.0], requires_grad=True)
+            ErfGrad.apply(x, alpha).sum().backward()
+            grads.append(x.grad.item())
+        assert abs(grads[1] / grads[0] - 4.0) < 1e-4, (
+            f"Prefactor must scale linearly with alpha, got ratio {grads[1] / grads[0]}"
         )
 
     def test_symmetry(self):

@@ -3,7 +3,47 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 from torch.optim.optimizer import Optimizer
+
+_NORM_TYPES = (
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.BatchNorm3d,
+    nn.SyncBatchNorm,
+    nn.LayerNorm,
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
+    nn.InstanceNorm3d,
+)
+
+
+def _binarizable_params(model: nn.Module, binarize_bias: bool = False):
+    """Select parameters that are safe to force onto {-1, +1}.
+
+    Norm affine parameters are always excluded (driving them bipolar destroys
+    normalization), and biases are excluded unless explicitly requested.
+    """
+    owner_of = {}
+    for m in model.modules():
+        for p in m.parameters(recurse=False):
+            owner_of[id(p)] = m
+    kept = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.endswith("bias") and not binarize_bias:
+            continue
+        if isinstance(owner_of.get(id(p)), _NORM_TYPES):
+            continue
+        kept.append(p)
+    if not kept:
+        raise ValueError(
+            "BinaryConnect found no binarizable parameters; every parameter "
+            "was excluded as a bias or norm affine parameter."
+        )
+    return kept
 
 
 class SpikeAdamW(Optimizer):
@@ -78,9 +118,23 @@ class BinaryConnect(Optimizer):
 
     Weights are clamped to [-1, 1] and binarized to {-1, +1} via sign().
     A straight-through estimator (STE) is used for gradient flow.
+
+    Pass an ``nn.Module`` and only binarizable parameters are used (norm
+    affine parameters and biases are excluded automatically). Passing a raw
+    parameter list keeps the previous behavior — every parameter given is
+    binarized, so make sure you filtered it yourself.
     """
 
-    def __init__(self, params, lr: float = 1e-3, momentum: float = 0.9, weight_decay: float = 1e-4):
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        momentum: float = 0.9,
+        weight_decay: float = 1e-4,
+        binarize_bias: bool = False,
+    ):
+        if isinstance(params, nn.Module):
+            params = _binarizable_params(params, binarize_bias=binarize_bias)
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
         super().__init__(params, defaults)
 

@@ -63,6 +63,17 @@ class SpikingLSTMCell(nn.Module):
         self.h = None
         self.c = None
 
+    def detach_hidden(self):
+        """Detach recurrent state from the autograd graph.
+
+        Call between sequences when NOT resetting (e.g. truncated BPTT or
+        stateful streaming) to avoid retaining the whole computation graph.
+        """
+        if self.h is not None:
+            self.h = self.h.detach()
+        if self.c is not None:
+            self.c = self.c.detach()
+
 
 class SpikingLSTM(nn.Module):
     """Multi-layer Spiking LSTM for temporal sequence tasks."""
@@ -106,6 +117,10 @@ class SpikingLSTM(nn.Module):
         for cell in self.cells:
             cell.reset_state()
 
+    def detach_hidden(self):
+        for cell in self.cells:
+            cell.detach_hidden()
+
     def set_sfa_mode(self, enabled: bool):
         for cell in self.cells:
             cell.neuron.set_sfa_mode(enabled)
@@ -133,3 +148,7 @@ class SpikingRNNCell(nn.Module):
 
     def reset_state(self):
         self.h = None
+
+    def detach_hidden(self):
+        if self.h is not None:
+            self.h = self.h.detach()

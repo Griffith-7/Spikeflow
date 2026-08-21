@@ -36,7 +36,15 @@ class MixedPrecisionSFA:
         self.device = torch.device(device) if isinstance(device, str) else device
         self.dtype = dtype
         self.grad_clip = grad_clip
-        self.scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
+        # Key AMP off the actual device type: autocast("cuda") on a CPU
+        # tensor silently does nothing useful and GradScaler assumes CUDA.
+        self.amp_device = self.device.type
+        if self.amp_device != "cuda" and dtype == torch.float16:
+            # fp16 autocast is CUDA-only; CPU autocast supports bf16.
+            self.dtype = torch.bfloat16
+        self.scaler = torch.amp.GradScaler(
+            self.amp_device, enabled=(self.dtype == torch.float16)
+        )
 
         from spikeflow.training.sfa import EMA
         self.ema = EMA(model, decay=ema_decay) if ema_decay > 0 else None
@@ -46,7 +54,7 @@ class MixedPrecisionSFA:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast("cuda", dtype=self.dtype):
+        with torch.autocast(self.amp_device, dtype=self.dtype):
             output = self.model(x)
             loss = criterion(output, y)
 
@@ -74,7 +82,7 @@ class MixedPrecisionSFA:
                     m.reset_state()
             acc = None
             for _ in range(timesteps):
-                with torch.autocast("cuda", dtype=self.dtype):
+                with torch.autocast(self.amp_device, dtype=self.dtype):
                     out = self.model(x)
                 acc = out if acc is None else acc + out
             loss = criterion(acc / timesteps, y)

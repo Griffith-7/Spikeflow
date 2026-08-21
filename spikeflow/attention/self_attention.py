@@ -13,16 +13,19 @@ from spikeflow.neurons.lif import LIFNode
 class SpikingSelfAttention(nn.Module):
     """Self-attention mechanism using spike-based computation.
 
-    Instead of expensive floating-point Q*K^T attention, this uses
-    XNOR-based binary attention: dot products become popcount operations.
-
-    Standard attention:  softmax(Q @ K^T / sqrt(d)) @ V     → O(d^2) MACs
-    Spike attention:    XNOR(Q, K) -> popcount -> scale @ V  → O(d^2) ADDs
+    Q and K come from spiking neurons; attention logits use their (near-)
+    binary activations. The ``xnor``/``sign`` mode computes
+    ``sign(Q) @ sign(K)^T``, which is mathematically equivalent to an
+    XNOR + popcount similarity: matching bits contribute +1, mismatching
+    bits -1. Note that on current hardware this is still *executed* as a
+    floating-point matmul — the addition-only speedup of true bit-packed
+    XNOR-popcount requires custom kernels, so treat this mode as a
+    functional simulation of binary attention, not a faster matmul.
 
     Supports three modes:
-    1. 'xnor'    - Binary XNOR attention (fastest, lowest energy)
-    2. 'rate'    - Rate-coded attention (better accuracy)
-    3. 'hybrid'  - XNOR with rate-coded correction (best balance)
+    1. 'xnor'/'sign' - binarized QK^T via sign (simulated popcount)
+    2. 'rate'        - Rate-coded attention (better accuracy)
+    3. 'hybrid'      - blend of the two (best balance)
     """
 
     def __init__(
@@ -33,14 +36,25 @@ class SpikingSelfAttention(nn.Module):
         attention_mode: str = "xnor",
         threshold: float = 1.0,
         tau: float = 2.0,
+        hybrid_blend: float = 0.7,
     ):
         super().__init__()
         assert d_model % n_heads == 0
+        valid_modes = ("xnor", "sign", "rate", "hybrid")
+        if attention_mode not in valid_modes:
+            raise ValueError(
+                f"attention_mode must be one of {valid_modes}, got '{attention_mode}'"
+            )
+        if not 0.0 <= hybrid_blend <= 1.0:
+            raise ValueError("hybrid_blend must be between 0.0 and 1.0")
 
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        if attention_mode == "sign":
+            attention_mode = "xnor"  # alias
         self.attention_mode = attention_mode
+        self.hybrid_blend = hybrid_blend
         self.scale = self.d_head ** 0.5
 
         # Standard linear projections (same as nn.MultiheadAttention)
@@ -84,18 +98,27 @@ class SpikingSelfAttention(nn.Module):
             return output, attn_weights
         return output
 
-    def _xnor_attention(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
-        """Binary XNOR attention — addition-only, no multiplications.
+    def _binarize(self, x: Tensor) -> Tensor:
+        """Map activations to {-1, +1}.
 
-        Q, K are binary spikes: XNOR produces 1 when equal, 0 when different.
-        Popcount(Q == K) approximates the attention weights.
+        ``sign()`` alone would emit 0 for exact zeros, which breaks the
+        bipolar assumption of XNOR-style similarity — ties are resolved to +1.
         """
-        # Binarize: sign(x) -> {-1, +1}, then XNOR = sign(q) * sign(k)
-        q_bin = q.sign()
-        k_bin = k.sign()
+        one = torch.ones_like(x)
+        return torch.where(x >= 0, one, -one)
 
-        # XNOR = element-wise multiply of sign representations
-        # Popcount along d_head: sum of XNOR / d_head gives similarity
+    def _xnor_attention(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Binarized (sign) attention — functional simulation of XNOR-popcount.
+
+        With bipolar {-1, +1} codes, elementwise product == XNOR: +1 when bits
+        match, -1 when they differ. The row sum is therefore
+        popcount(match) - popcount(mismatch), i.e. the XNOR similarity score.
+        Executed here as an fp32 matmul; a bit-packed integer kernel would be
+        needed for the actual addition-only speedup.
+        """
+        q_bin = self._binarize(q)
+        k_bin = self._binarize(k)
+
         attn = torch.matmul(q_bin, k_bin.transpose(-2, -1)) / self.scale
 
         # Softmax to get attention weights
@@ -115,11 +138,11 @@ class SpikingSelfAttention(nn.Module):
         return attn_out, attn_weights
 
     def _hybrid_attention(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
-        """XNOR for coarse attention + rate-coded fine adjustment."""
-        q_bin = q.sign()
-        k_bin = k.sign()
+        """Binarized coarse attention + rate-coded fine adjustment."""
+        q_bin = self._binarize(q)
+        k_bin = self._binarize(k)
 
-        # Coarse: XNOR
+        # Coarse: XNOR-style similarity
         coarse_attn = torch.matmul(q_bin, k_bin.transpose(-2, -1)) / self.scale
 
         # Fine: rate-coded correction
@@ -127,8 +150,8 @@ class SpikingSelfAttention(nn.Module):
         k_rate = k.float()
         fine_attn = torch.matmul(q_rate, k_rate.transpose(-2, -1)) / self.scale
 
-        # Blend: 70% coarse (fast) + 30% fine (accurate)
-        attn = 0.7 * coarse_attn + 0.3 * fine_attn
+        # Blend: coarse (fast) + fine (accurate)
+        attn = self.hybrid_blend * coarse_attn + (1.0 - self.hybrid_blend) * fine_attn
         attn_weights = F.softmax(attn, dim=-1)
         attn_weights = self.dropout(attn_weights)
 

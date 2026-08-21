@@ -17,6 +17,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from spikeflow.neurons.base import BaseNeuron
+
 
 @dataclass
 class EnergyProfile:
@@ -27,6 +29,7 @@ class EnergyProfile:
     total_params: int = 0
     energy_synops_mj: float = 0.0
     energy_macs_mj: float = 0.0
+    energy_mem_mj: float = 0.0
     energy_saving_pct: float = 0.0
     spike_rate: float = 0.0
     memory_bytes: int = 0
@@ -86,84 +89,141 @@ class EnergyProfiler:
         input_shape: tuple[int, ...] = (1, 3, 224, 224),
         timesteps: int = 4,
     ) -> EnergyProfile:
-        """Profile an SNN model's energy consumption."""
+        """Profile an SNN model's energy consumption.
+
+        Runs the model for ``timesteps`` steps with hooks attached:
+          - compute layers record real output shapes so per-layer op counts
+            include spatial positions and token counts;
+          - spiking neurons record their actual output spike fraction, which
+            scales SynOps (only fired spikes drive downstream computation).
+        """
         model.eval()
-        device = next(model.parameters()).device if list(model.parameters()) else torch.device("cpu")
+        params = list(model.parameters())
+        device = params[0].device if params else torch.device("cpu")
 
         profile = EnergyProfile(model_name=type(model).__name__)
-
-        # Count parameters
         profile.total_params = sum(p.numel() for p in model.parameters())
 
-        # Measure spike rates
-        x = torch.randn(*input_shape, device=device)
+        # --- hooks: capture layer output shapes and internal spike rates ---
+        layer_shapes: dict[int, tuple] = {}
+        spike_events = [0.0]
+        spike_elements = [0]
 
-        # Reset states
+        def shape_hook(idx):
+            def hook(_m, _inp, out):
+                out_shape = out.shape if isinstance(out, torch.Tensor) else out[0].shape
+                layer_shapes[idx] = tuple(out_shape)
+            return hook
+
+        compute_modules = {}
+        idx = 0
+        for m in model.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+                compute_modules[idx] = m
+                m.register_forward_hook(shape_hook(idx))
+                idx += 1
+
+        def neuron_hook(_m, _inp, out):
+            out_t = out if isinstance(out, torch.Tensor) else out[0]
+            spike_events[0] += (out_t > 0).sum().item()
+            spike_elements[0] += out_t.numel()
+
+        neuron_handles = [
+            m.register_forward_hook(neuron_hook)
+            for m in model.modules()
+            if isinstance(m, BaseNeuron)
+        ]
+
+        x = torch.randn(*input_shape, device=device)
         for m in model.modules():
             if hasattr(m, "reset_state"):
                 m.reset_state()
 
-        spike_counts = []
-        for t in range(timesteps):
-            out = model(x)
-            spike_rate = (out > 0).float().mean().item()
-            spike_counts.append(spike_rate)
+        try:
+            for _ in range(timesteps):
+                model(x)
+        finally:
+            for h in neuron_handles:
+                h.remove()
 
-        profile.spike_rate = sum(spike_counts) / len(spike_counts)
+        internal_spike_rate = (
+            spike_events[0] / spike_elements[0] if spike_elements[0] else 0.0
+        )
+        profile.spike_rate = internal_spike_rate
 
-        # Count synaptic operations
-        profile.total_synops = self._count_synops(model, input_shape, timesteps)
-        profile.total_macs = self._estimate_macs(model, input_shape)
+        ops_per_step = self._count_ops(compute_modules, layer_shapes, input_shape)
 
-        # Compute energy
+        # SynOps: every timestep, each synapse processes an event only when
+        # the upstream neuron actually spiked -> scale by measured rate.
+        profile.total_synops = int(ops_per_step * timesteps * internal_spike_rate)
+        # ANN-equivalent MACs: one non-spiking pass over the same graph.
+        profile.total_macs = ops_per_step
+
+        # Compute energy. Compute energies (SynOps vs MACs) are compared
+        # directly; weight-memory traffic is reported separately because on
+        # GPUs it dominates and would mask the synaptic-operation saving.
         synop_energy = profile.total_synops * self.hw["add_energy_pj"] / 1e9  # to mJ
         mac_energy = profile.total_macs * self.hw["mac_energy_pj"] / 1e9
         mem_energy = profile.total_params * 4 * timesteps * self.hw["mem_energy_pj"] / 1e9  # FP32
 
-        profile.energy_synops_mj = synop_energy + mem_energy
+        profile.energy_synops_mj = synop_energy
         profile.energy_macs_mj = mac_energy
+        profile.energy_mem_mj = mem_energy
         profile.energy_saving_pct = (1 - profile.energy_synops_mj / max(profile.energy_macs_mj, 1e-10)) * 100
 
         return profile
 
-    def _count_synops(self, model: nn.Module, input_shape: tuple, timesteps: int) -> int:
-        """Count total synaptic operations."""
-        total = 0
-        for module in model.modules():
-            if isinstance(module, nn.Linear):
-                # Linear: in * out per token
-                total += module.in_features * module.out_features
-            elif isinstance(module, nn.Conv2d):
-                # Conv: C_out * C_in * K * K * H * W
-                k = module.kernel_size[0] * module.kernel_size[1]
-                total += module.out_channels * module.in_channels * k
-        batch_size = input_shape[0]
-        total *= batch_size * timesteps
-        return total
+    @staticmethod
+    def _layer_ops(module: nn.Module, out_shape: tuple | None, input_shape: tuple) -> int:
+        """Op count for one compute layer for a single timestep, using the
+        captured output shape when available."""
+        if isinstance(module, nn.Linear):
+            tokens = 1
+            for s in out_shape[1:-1] if out_shape is not None and len(out_shape) > 2 else []:
+                tokens *= s
+            return module.in_features * module.out_features * tokens
+        if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+            k = 1
+            for s in module.kernel_size:
+                k *= s
+            cin_eff = module.in_channels // module.groups
+            spatial = None
+            if out_shape is not None:
+                spatial = 1
+                for s in out_shape[2:]:
+                    spatial *= s
+            else:
+                spatial = 1
+                for s in input_shape[2:]:
+                    spatial *= s
+            return module.out_channels * cin_eff * k * spatial
+        return 0
 
-    def _estimate_macs(self, model: nn.Module, input_shape: tuple) -> int:
-        """Estimate MAC operations for equivalent ANN."""
+    def _count_ops(self, compute_modules: dict, layer_shapes: dict, input_shape: tuple) -> int:
+        """Total ops across all compute layers for one timestep."""
         total = 0
-        for module in model.modules():
-            if isinstance(module, nn.Linear):
-                total += 2 * module.in_features * module.out_features
-            elif isinstance(module, nn.Conv2d):
-                k = module.kernel_size[0] * module.kernel_size[1]
-                total += 2 * module.out_channels * module.in_channels * k
-        batch_size = input_shape[0]
-        if len(input_shape) > 2:
-            spatial = input_shape[2] * input_shape[3]
-            total *= batch_size * spatial
-        else:
-            total *= batch_size
-        return total
+        for idx, module in compute_modules.items():
+            total += self._layer_ops(module, layer_shapes.get(idx), input_shape)
+        return max(total, 1)
+
+    def estimate_ann_macs(self, model: nn.Module, input_shape: tuple[int, ...]) -> int:
+        """Estimate single-pass MAC operations for the equivalent ANN graph."""
+        compute_modules = {
+            i: m
+            for i, m in enumerate(
+                mod for mod in model.modules()
+                if isinstance(mod, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d))
+            )
+        }
+        return self._count_ops(compute_modules, {}, input_shape)
 
     def compare(self, snn_profile: EnergyProfile, ann_macs: int) -> dict[str, Any]:
-        """Compare SNN vs ANN energy."""
+        """Compare SNN vs ANN compute energy (memory traffic excluded)."""
         ann_energy = ann_macs * self.hw["mac_energy_pj"] / 1e9
         return {
             "snn_energy_mj": snn_profile.energy_synops_mj,
             "ann_energy_mj": ann_energy,
+            "snn_memory_energy_mj": snn_profile.energy_mem_mj,
             "energy_saving_pct": (1 - snn_profile.energy_synops_mj / max(ann_energy, 1e-10)) * 100,
             "snn_synops": snn_profile.total_synops,
             "ann_macs": ann_macs,
@@ -180,9 +240,14 @@ class EnergyProfiler:
             f"  SynOps:           {profile.total_synops:>15,}",
             f"  MACs (ANN equiv): {profile.total_macs:>15,}",
             f"  Spike Rate:       {profile.spike_rate:>14.2%}",
-            f"  Energy (SNN):     {profile.energy_synops_mj:>12.3f} mJ",
-            f"  Energy (ANN):     {profile.energy_macs_mj:>12.3f} mJ",
+            f"  Energy (SNN compute): {profile.energy_synops_mj:>10.3f} mJ",
+            f"  Energy (ANN compute): {profile.energy_macs_mj:>10.3f} mJ",
+            f"  Energy (weight memory): {profile.energy_mem_mj:>8.3f} mJ",
             f"  Energy Saving:    {profile.energy_saving_pct:>11.1f}%",
             "=" * 60,
         ]
         return "\n".join(lines)
+
+    def _estimate_macs(self, model: nn.Module, input_shape: tuple) -> int:
+        """Backward-compatible alias for :meth:`estimate_ann_macs`."""
+        return self.estimate_ann_macs(model, input_shape)

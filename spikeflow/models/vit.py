@@ -137,13 +137,16 @@ class SpikingViT(nn.Module):
         return self.head(x)
 
     def reset_state(self):
-        for m in self.children():
-            if hasattr(m, "reset_state"):
+        # self.modules() (not children()): nn.ModuleList containers have no
+        # reset_state themselves, so iterating children would silently skip
+        # every transformer block.
+        for m in self.modules():
+            if m is not self and hasattr(m, "reset_state"):
                 m.reset_state()
 
     def set_sfa_mode(self, enabled: bool):
-        for m in self.children():
-            if hasattr(m, "set_sfa_mode"):
+        for m in self.modules():
+            if m is not self and hasattr(m, "set_sfa_mode"):
                 m.set_sfa_mode(enabled)
 
 

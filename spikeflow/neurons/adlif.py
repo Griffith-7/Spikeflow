@@ -12,9 +12,14 @@ class AdaptiveLIFNode(BaseNeuron):
 
     Adds a slow adaptation variable a that increases the effective
     threshold after each spike, modeling spike-frequency adaptation:
-        v(t+1) = decay * v(t) + x(t) - threshold - a(t)
-        spike = (v >= 0)
+
+        v(t+1) = decay * v(t) + x(t) - a(t)
+        spike  = (v >= threshold)
         a(t+1) = decay_a * a(t) + delta_a * spike
+
+    (The adaptation variable is subtracted from the membrane charge and the
+    neuron still fires at ``threshold`` — the two formulations are equivalent
+    up to a constant shift of v.)
 
     Useful for detecting temporal changes and encoding novelty.
     """
@@ -57,7 +62,11 @@ class AdaptiveLIFNode(BaseNeuron):
             self.a = torch.zeros_like(x)
 
         self.v = self.charge(x)
-        if self._readout:
+        if self._readout or self._sfa_mode:
+            # Readout/SFA mode: no binary spikes, so derive pseudo-spikes from
+            # threshold crossings to keep the adaptation variable updating.
+            pseudo = (self.v >= self.threshold_module.threshold).detach().to(self.a.dtype)
+            self.a = self.a + self.delta_a * pseudo
             return self.v
         spike = self.fire(self.v)
         self.neuronal_reset(spike)

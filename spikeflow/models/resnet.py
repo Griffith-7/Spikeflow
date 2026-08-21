@@ -15,62 +15,71 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from spikeflow.layers.conv import SpikingConv2d
 from spikeflow.layers.linear import SpikingLinear
+from spikeflow.neurons.lif import LIFNode
 
 
 class SpikingBasicBlock(nn.Module):
-    """Basic residual block with spiking neurons (ResNet-18/34)."""
+    """Basic residual block with spiking neurons (ResNet-18/34).
+
+    Ordering is Conv -> BN -> LIF: BatchNorm always sees conv outputs, so its
+    running statistics stay consistent between SFA training (neuron = ReLU)
+    and T=D spike inference (neuron emits binary spikes). The residual sum is
+    passed through the block's output neuron.
+    """
 
     expansion = 1
 
     def __init__(self, in_channels, out_channels, stride=1, downsample=None, threshold=1.0, tau=2.0):
         super().__init__()
-        self.conv1 = SpikingConv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False, threshold=threshold, tau=tau)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = SpikingConv2d(out_channels, out_channels, 3, padding=1, bias=False, threshold=threshold, tau=tau)
+        self.neuron1 = LIFNode(threshold=threshold, tau=tau)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
+        self.neuron2 = LIFNode(threshold=threshold, tau=tau)
         self.downsample = downsample
 
     def forward(self, x: Tensor) -> Tensor:
         identity = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
+        out = self.neuron1(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
         if self.downsample is not None:
             identity = self.downsample(x)
         out = out + identity
-        return out
+        return self.neuron2(out)
 
 
 class SpikingBottleneck(nn.Module):
-    """Bottleneck residual block with spiking neurons (ResNet-50/101/152)."""
+    """Bottleneck residual block with spiking neurons (ResNet-50/101/152).
+
+    Same Conv -> BN -> LIF ordering as :class:`SpikingBasicBlock`.
+    """
 
     expansion = 4
 
     def __init__(self, in_channels, out_channels, stride=1, downsample=None, threshold=1.0, tau=2.0):
         super().__init__()
-        self.conv1 = SpikingConv2d(in_channels, out_channels, 1, bias=False, threshold=threshold, tau=tau)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = SpikingConv2d(out_channels, out_channels, 3, stride=stride, padding=1, bias=False, threshold=threshold, tau=tau)
+        self.neuron1 = LIFNode(threshold=threshold, tau=tau)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.conv3 = SpikingConv2d(out_channels, out_channels * self.expansion, 1, bias=False, threshold=threshold, tau=tau)
+        self.neuron2 = LIFNode(threshold=threshold, tau=tau)
+        self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, 1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
+        self.neuron3 = LIFNode(threshold=threshold, tau=tau)
         self.downsample = downsample
 
     def forward(self, x: Tensor) -> Tensor:
         identity = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.conv3(out)
-        out = self.bn3(out)
+        out = self.neuron1(self.bn1(self.conv1(x)))
+        out = self.neuron2(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
         if self.downsample is not None:
             identity = self.downsample(x)
         out = out + identity
-        return out
+        return self.neuron3(out)
 
 
 class SpikingResNet(nn.Module):
@@ -91,8 +100,10 @@ class SpikingResNet(nn.Module):
         super().__init__()
 
         self.in_channels = 64
-        self.conv1 = SpikingConv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False, threshold=threshold, tau=tau)
+        # Stem: Conv -> BN -> LIF -> MaxPool
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
+        self.neuron1 = LIFNode(threshold=threshold, tau=tau)
         self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.layer1 = self._make_layer(block, 64, layers[0], threshold=threshold, tau=tau)
@@ -108,8 +119,10 @@ class SpikingResNet(nn.Module):
     def _make_layer(self, block, out_channels, blocks, stride=1, threshold=1.0, tau=2.0):
         downsample = None
         if stride != 1 or self.in_channels != out_channels * block.expansion:
+            # Shortcut: Conv -> BN (no neuron) so the residual add happens on
+            # analog magnitudes before the block's output neuron.
             downsample = nn.Sequential(
-                SpikingConv2d(self.in_channels, out_channels * block.expansion, 1, stride=stride, bias=False, threshold=threshold, tau=tau),
+                nn.Conv2d(self.in_channels, out_channels * block.expansion, 1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_channels * block.expansion),
             )
         layers = [block(self.in_channels, out_channels, stride, downsample, threshold=threshold, tau=tau)]
@@ -120,14 +133,14 @@ class SpikingResNet(nn.Module):
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, SpikingConv2d):
-                nn.init.kaiming_normal_(m.conv.weight, mode="fan_out", nonlinearity="relu")
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.pool(self.bn1(self.conv1(x)))
+        x = self.pool(self.neuron1(self.bn1(self.conv1(x))))
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)

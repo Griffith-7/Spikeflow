@@ -7,6 +7,7 @@ training overhead of traditional SNN training via BPTT.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import torch
@@ -18,13 +19,6 @@ def _set_sfa_recursive(module: nn.Module, enabled: bool):
     for child in module.modules():
         if hasattr(child, "set_sfa_mode"):
             child.set_sfa_mode(enabled)
-
-
-def _set_readout_recursive(module: nn.Module, enabled: bool):
-    """Recursively enable/disable readout mode on all SpikeFlow modules."""
-    for child in module.modules():
-        if hasattr(child, "set_readout"):
-            child.set_readout(enabled)
 
 
 class EMA:
@@ -41,13 +35,22 @@ class EMA:
             self.shadow[name].mul_(self.decay).add_(param, alpha=1 - self.decay)
 
     def apply_shadow(self):
+        if getattr(self, "_applied", False):
+            raise RuntimeError(
+                "EMA.apply_shadow() called twice without restore(). "
+                "Call restore() first or the backup would be corrupted."
+            )
         self._backup = {name: param.clone() for name, param in self.model.named_parameters()}
         for name, param in self.model.named_parameters():
             param.data.copy_(self.shadow[name])
+        self._applied = True
 
     def restore(self):
+        if not getattr(self, "_applied", False):
+            return
         for name, param in self.model.named_parameters():
             param.data.copy_(self._backup[name])
+        self._applied = False
 
 
 class SFATrainer:
@@ -90,19 +93,39 @@ class SFATrainer:
         self.scheduler = scheduler
         self.device = torch.device(device) if isinstance(device, str) else device
         self.grad_clip = grad_clip
-        self.scaler = torch.amp.GradScaler() if use_mixed_precision else None
+
+        # AMP is only reliable on CUDA; silently running autocast("cuda") on a
+        # CPU device breaks training, so disable it with a warning instead.
+        if use_mixed_precision and self.device.type != "cuda":
+            warnings.warn(
+                f"use_mixed_precision=True requires a CUDA device, got "
+                f"'{self.device.type}'; disabling mixed precision.",
+                stacklevel=2,
+            )
+            use_mixed_precision = False
+        self.use_amp = use_mixed_precision
+        self.scaler = torch.amp.GradScaler(self.device.type) if self.use_amp else None
         self.ema = EMA(model, decay=ema_decay) if ema_decay > 0 else None
 
     def enable_sfa_mode(self):
-        """Switch model to SFA mode (ReLU-like, T=1 training)."""
+        """Switch model to SFA mode (ReLU-like, T=1 training).
+
+        Readout configuration is intentionally left untouched: it is a static
+        per-layer property (classification heads set ``readout=True`` at
+        construction). Toggling it globally would either break the head or —
+        worse — turn every hidden neuron into an analog readout during spike
+        inference, eliminating all binary spikes.
+        """
         _set_sfa_recursive(self.model, enabled=True)
-        _set_readout_recursive(self.model, enabled=False)
-        self.model.eval()  # We'll handle train/eval ourselves
 
     def enable_spike_mode(self, timesteps: int = 4):
-        """Switch model to spike mode for inference."""
+        """Switch model to spike mode for inference.
+
+        Only SFA mode is disabled; neurons configured with ``readout=True``
+        (typically the classification head) keep returning membrane
+        potentials while all hidden neurons emit binary spikes.
+        """
         _set_sfa_recursive(self.model, enabled=False)
-        _set_readout_recursive(self.model, enabled=True)
         self.timesteps = timesteps
 
     def train_sfa(
@@ -132,7 +155,7 @@ class SFATrainer:
 
             # Forward pass — single step, like transformer
             if self.scaler:
-                with torch.amp.autocast("cuda"):
+                with torch.amp.autocast(self.device.type):
                     output = self.model(data)
                     loss = criterion(output, targets)
                 self.scaler.scale(loss).backward()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -51,6 +53,11 @@ class ParametricLIFNode(BaseNeuron):
 
     The decay factor is learned per-channel, allowing different
     neurons to have different temporal dynamics.
+
+    ``tau_param`` is unconstrained; the effective time constant is
+    ``softplus(tau_param)``, which is guaranteed positive. A raw negative
+    value therefore yields a small (fast) tau instead of an exploding
+    ``decay = exp(-dt/tau) > 1``.
     """
 
     def __init__(
@@ -63,14 +70,21 @@ class ParametricLIFNode(BaseNeuron):
         v_reset: float = 0.0,
     ):
         super().__init__(threshold, surrogate, tau_init, dt, v_reset)
+        if not (math.isfinite(tau_init) and tau_init > 0.0):
+            raise ValueError("tau_init must be finite and positive")
+        raw_tau_init = tau_init + math.log(-math.expm1(-tau_init))
+        # Inverse-softplus init so the effective tau equals tau_init.
         self.tau_param = nn.Parameter(
-            torch.full((channels,), tau_init)
+            torch.full((channels,), raw_tau_init)
         )
 
     @property
-    def decay(self) -> torch.Tensor:
-        return torch.exp(-self.dt / self.tau_param)
+    def tau_values(self) -> torch.Tensor:
+        return nn.functional.softplus(self.tau_param)
 
+    @property
+    def decay(self) -> torch.Tensor:
+        return torch.exp(-self.dt / self.tau_values)
     def charge(self, x: torch.Tensor) -> torch.Tensor:
         if self._sfa_mode:
             return torch.relu(x)
